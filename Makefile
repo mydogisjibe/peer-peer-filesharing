@@ -2,6 +2,9 @@ CC      = gcc
 CFLAGS  = -O
 LDFLAGS  = -O 
 
+tracker: tracker.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 setPrimes: setPrimes.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
@@ -9,6 +12,7 @@ primes.txt: setPrimes
 	./setPrimes
 
 clean:
-	rm *.o
-	rm setPrimes
-	rm primes.txt
+	rm -f *.o
+	rm -f tracker
+	rm -f setPrimes
+	rm -f primes.txt
