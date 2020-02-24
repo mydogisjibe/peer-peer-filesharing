@@ -1,6 +1,12 @@
 CC      = gcc
 CFLAGS  = -O
-LDFLAGS  = -O 
+LDFLAGS  = -O -g
+
+initial_peer: initial_peer.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+peer: peer.o
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 tracker: tracker.o
 	$(CC) -o $@ $^ $(LDFLAGS)

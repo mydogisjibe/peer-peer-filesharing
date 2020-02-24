@@ -10,7 +10,9 @@
 
 #define MAX_PEERS 5
 
-char ipList[MAX_PEERS*INET_ADDRSTRLEN] = "No IPs yet";
+//7 represents space for a : followed by the port number, then a return.
+char ipList[MAX_PEERS*(INET_ADDRSTRLEN+7)] = "No IPs yet";
+
 size_t ipSize = 0;
 int peerNum = 0;
 int main(int argc, char const *argv[])
@@ -72,11 +74,17 @@ int main(int argc, char const *argv[])
 
         printf("Query: %s\n", buffer);
         
-        if(buffer[0] == 'P') {
+        if(buffer[0] == 'A') {
             if(peerNum < MAX_PEERS) {
                 peerNum++;
                 inet_ntop(AF_INET, &(address.sin_addr), ipList+ipSize, INET_ADDRSTRLEN);
+                ipSize += strlen(ipList + ipSize)+1;
+                ipList[ipSize-1] = ':';
+
+                unsigned int port = ntohs(address.sin_port);
+                sprintf(ipList+ipSize, "%d", port);
                 ipSize += strlen(ipList + ipSize) + 1;
+
                 ipList[ipSize-1] = '\n';
                 send(new_socket, "ADDED", 5, 0);
             }
@@ -85,7 +93,7 @@ int main(int argc, char const *argv[])
             }
         }
         else if(buffer[0] == 'D') {
-            if(ipList[0] != '\0')
+            if(ipSize != 0)
                 send(new_socket, ipList, ipSize, 0);
             else
                 send(new_socket, "EMPTY", 5, 0);
