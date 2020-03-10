@@ -10,11 +10,59 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "file_network.h"
 
 #define FILE_TO_SHARE "primes.txt"
 #define MAX_PEERS 10
+
+int64_t get_requested_chunk(int read_stream) {
+    char request;
+    int64_t requested_chunk;
+
+    int len = read(read_stream, &request, 1);
+    if(request == 'D') {
+        printf("Peer is finished downloading.\n");
+        return -1;
+    }
+    if(len == 0) {
+        printf("Connection closed unexpectedly\n");
+        return -1;
+    }
+    if(len != 1 || request != 'C') {
+        printf("Peer made unknown request of length %d and text %d\n", len, request);
+        if(len < 0) {
+            perror("Failure when trying to read request type");
+        }
+        return -1;
+    }
+
+    len = read(read_stream, &requested_chunk, sizeof(int64_t));
+
+    if(len != sizeof(int64_t)) {
+        printf("Peer failed to ask for a chunk\n");
+        if(len < 0) {
+            perror("Failure when trying to get chunk id");
+        }
+        return -1;
+    }
+
+    return requested_chunk;
+}
+
+
+char * send_to_peer(int write_stream, char *start, size_t length ) {
+    ssize_t len = write(write_stream, start, length);
+    if(len <= 0) {
+        printf("Error: peer lost\n");
+        return NULL;
+    }
+    start += len;
+    return start;
+}
+
+
    
 int main(int argc, char const *argv[]) 
 { 
@@ -36,10 +84,6 @@ int main(int argc, char const *argv[])
         return -1;
     }
 
-    struct linger lin;
-    lin.l_onoff = 1;
-    lin.l_linger = 0;
-    setsockopt(sock, SOL_SOCKET, SO_LINGER, (const char *) &lin, sizeof(int));
    
     memset(&serv_addr, 0, sizeof(serv_addr)); 
    
@@ -68,39 +112,10 @@ int main(int argc, char const *argv[])
     getsockname(sock, (struct sockaddr *) &my_address, &len);
     int my_port = ntohs(my_address.sin_port);
     close(sock);
-    //Quickly host a server with the same port
-    int server_sock;
-    if((server_sock = socket(AF_INET, SOCK_STREAM, 0)) == 0)
-    {
-        printf("socket failed\n");
-        return -1;
-    }
-    
-    //Set socket to port from before
-    if(setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        printf("setsockopt failed\n");
-        return -1;
-    }
 
 
-    serv_addr.sin_family = AF_INET; 
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(my_port);
-    printf("Attempting to reuse port %d\n", my_port);
-    if(bind(server_sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Binding the hosting socket failed\n");
-        return -1;
-    }
-    
-    if(listen(server_sock, MAX_PEERS) < 0) {
-        printf("Listening to socket failed\n");
-        return -1;
-    }
 
-
-    
-    //Serve up file to anyone who wants it
-
+    //Store file into RAM for easy sending
     int fd = open(FILE_TO_SHARE, O_RDONLY);
     if(fd < 0) {
         printf("File couldn't be opened.\n");
@@ -138,20 +153,66 @@ int main(int argc, char const *argv[])
     close(fd);
 
 
+
+    //Create Server
+    int server_sock;
+    if((server_sock = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+    {
+        printf("socket failed\n");
+        return -1;
+    }
+    
+    //Set socket to port from before
+    if(setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        printf("setsockopt failed\n");
+        return -1;
+    }
+
+
+    serv_addr.sin_family = AF_INET; 
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    serv_addr.sin_port = htons(my_port);
+    printf("Attempting to reuse port %d\n", my_port);
+    if(bind(server_sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Binding the hosting socket failed\n");
+        return -1;
+    }
+    
+    if(listen(server_sock, MAX_PEERS) < 0) {
+        printf("Listening to socket failed\n");
+        return -1;
+    }
+
+
+    
+
+
+
     fd_set read_set, write_set;
     int uploads[MAX_PEERS] = {0};
     int64_t upload_chunks[MAX_PEERS];
-    size_t progress_through_chunks[MAX_PEERS];
+    char *upload_progress[MAX_PEERS];
+    char *upload_end[MAX_PEERS];
     struct sockaddr_in address;
     int addrlen = sizeof(address);
     while(1) {
         FD_ZERO(&read_set);
         FD_ZERO(&write_set);
-        FD_SET(server_sock, &read_set);
 
+        //Find unused space in uploads array for new socket. If we can't find any, don't accept any new connections
+        int new_index;
+        for(new_index = 0;uploads[new_index] != 0 && new_index < MAX_PEERS;new_index++);
+        if(new_index < MAX_PEERS) {
+            FD_SET(server_sock, &read_set);
+        }
+
+        //Add any uploads currently in progress
         for(int i=0;i<MAX_PEERS;i++) {
             if(uploads[i]) {
-                FD_SET(uploads[i], &write_set);
+                FD_SET(uploads[i], &read_set);
+                if(upload_progress[i] != upload_end[i]){
+                    FD_SET(uploads[i], &write_set);
+                }
             }
         }
 
@@ -161,74 +222,77 @@ int main(int argc, char const *argv[])
 
         //Accepting new downloads
         if(FD_ISSET(server_sock, &read_set)) {
+            //has_failed set to true will skip through all the other code to exit this if statement
+            bool has_failed = false;
             int new_socket = accept(server_sock, (struct sockaddr*) &address, (socklen_t *)&addrlen);
             if(new_socket < 0) {
-                perror("Something went wrong earlier");
+                perror("Something went wrong trying to accept a new socket");
+                has_failed = true;
             }
-                
-            bool inserted = false;
-            for(int i=0;i<MAX_PEERS;i++) {
-                if(uploads[i] == 0) {
-                    uploads[i] = new_socket;
-                    progress_through_chunks[i] = 0;
-                    inserted = true;
-                    char request;
-                    int len = read(uploads[i], &request, 1);
-                    if(len != 1 || request != 'C') {
-                        printf("Peer made unknown request of length %d and text %d\n", len, request);
-                        if(len < 0) {
-                            perror("Somethings wrong");
-                        }
-                        inserted = false;
-                        uploads[i] = 0;
-                        break;
-                    }
-                    len = read(uploads[i], upload_chunks + i, sizeof(int64_t));
-                    if(len != sizeof(int64_t)) {
-                        printf("Peer failed to ask for a chunk\n");
-                    }
-                    else {
-                        size_t write_from = CHUNK_SIZE*upload_chunks[i] + progress_through_chunks[i];
-                        size_t full_data = (upload_chunks[i]+1)*CHUNK_SIZE >= buffer_fill_point ? buffer_fill_point % CHUNK_SIZE : CHUNK_SIZE;
-                        ssize_t len = write(uploads[i], file_buffer + write_from, full_data - write_from);
-                        if(len <= 0) {
-                            printf("Error: peer lost\n");
-                            uploads[i] = 0;
-                        }
-                        progress_through_chunks[i] += len;
-                        if(progress_through_chunks[i] == full_data) {
-                            close(uploads[i]);
-                            uploads[i] = 0;
-                        }
+            
+            //Get the chunk wanted from the client
+            int64_t chunk_id;
+            if(!has_failed) {
+                chunk_id = get_requested_chunk(new_socket);
+                if(chunk_id < 0 || chunk_id*CHUNK_SIZE >= filestats.st_size) {
+                    close(new_socket);
+                    printf("Failed to establish connection either because of error or malformed request\n");
+                    has_failed = true;
+                }
+            }
+            
+            //Send chunk to client
+            if(!has_failed) {
+                printf("Attempting first write\n");
+                size_t len = (chunk_id+1)*CHUNK_SIZE >= buffer_fill_point ? buffer_fill_point % CHUNK_SIZE : CHUNK_SIZE;
+                upload_end[new_index] = file_buffer+chunk_id*CHUNK_SIZE+len;
+                upload_progress[new_index] = send_to_peer(new_socket, upload_end[new_index]-len, len);
+                if(upload_progress[new_index] == NULL) {
+                    close(new_socket);
+                    has_failed = true;
+                }
 
-                    }
-                    break;
-                }
-                if(!inserted) {
-                    close(uploads[i]);
-                }
+            }
+            
+            //If past steps succeeded, record the new_socket id
+            if(!has_failed) {
+                printf("First write success! Wrote %d bytes\n", CHUNK_SIZE - (upload_end[new_index] - upload_progress[new_index]));
+                uploads[new_index] = new_socket;
             }
         }
 
         //Responding to already existing peers
         for(int i=0;i<MAX_PEERS;i++) {
             if(uploads[i] != 0 && FD_ISSET(uploads[i], &write_set)) {
-                size_t write_from = CHUNK_SIZE*upload_chunks[i] + progress_through_chunks[i];
-                size_t full_data = (upload_chunks[i]+1)*CHUNK_SIZE >= buffer_fill_point ? buffer_fill_point % CHUNK_SIZE : CHUNK_SIZE;
-                ssize_t len = write(uploads[i], file_buffer + write_from, full_data - write_from);
-                if(len <= 0) {
-                    printf("Error: peer lost\n");
+                printf("Ready for more writing\n"); //DEBUG
+                upload_progress[i] = send_to_peer(uploads[i], upload_progress[i], upload_end[i] - upload_progress[i]);
+                if(upload_progress[i] == NULL) {
+                    printf("More writing failed. Closing\n"); //DEBUG
+                    close(uploads[i]);
                     uploads[i] = 0;
                 }
-                progress_through_chunks[i] += len;
-                if(progress_through_chunks[i] == full_data) {
+            }
+
+            if(uploads[i] != 0 && FD_ISSET(uploads[i], &read_set)) {
+                int64_t chunk_id = get_requested_chunk(uploads[i]);
+                if(chunk_id < 0 || chunk_id*CHUNK_SIZE >= filestats.st_size) {
+                    printf("Connection dropped due to unexpected closing or unknown query\n");
+                    close(uploads[i]);
+                    uploads[i] = 0;
+                    continue;
+                }
+                
+
+                size_t len = (chunk_id+1)*CHUNK_SIZE >= buffer_fill_point ? buffer_fill_point % CHUNK_SIZE : CHUNK_SIZE;
+                upload_end[i] = file_buffer+chunk_id*CHUNK_SIZE+len;
+                upload_progress[i] = send_to_peer(uploads[i], upload_end[i]-len, len);
+                if(upload_progress[i] == NULL) {
+                    printf("Initial write failed\n"); //DEBUG
                     close(uploads[i]);
                     uploads[i] = 0;
                 }
             }
         }
-
-
     }
 
 

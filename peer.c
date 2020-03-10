@@ -6,70 +6,116 @@
 #include <arpa/inet.h>
 #include <string.h> 
 #include <unistd.h>
+#include <fcntl.h>
+
+#include "file_network.h"
+
+#define FILE_NAME "download.txt"
+#define FILE_SIZE 51099000
+#define BUFFER_SIZE 4096
    
+
 int main(int argc, char const *argv[]) 
 { 
 
     const char* ip = argv[1];
     int PORT = atoi(argv[2]);
-    int sock = 0, valread; 
     struct sockaddr_in serv_addr; 
-    char buffer[1048576] = {0}; 
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) 
-    { 
-        printf("\n Socket creation error \n"); 
-        return -1; 
-    } 
-   
-    memset(&serv_addr, 0, sizeof(serv_addr)); 
-   
-    serv_addr.sin_family = AF_INET; 
-    serv_addr.sin_port = htons(PORT); 
-       
-    // Convert IPv4 and IPv6 addresses from text to binary form 
-    if(inet_pton(AF_INET, ip, &serv_addr.sin_addr)<=0)  
-    { 
-        printf("\nInvalid address/ Address not supported \n"); 
-        return -1; 
-    } 
-   
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) 
-    { 
-        printf("\nConnection Failed \n"); 
-        return -1; 
-    } 
+    char buffer[BUFFER_SIZE] = {0}; 
 
-    printf("Enter string: ");
-    char data[130];
-    char* message = data;
-    size_t size = 130;
-    if(getline(&message, &size, stdin) == -1){
-        printf("Failed to read line");
+    int sock = get_connection_fd(ip, PORT);
+    if(sock < 0) {
+        fprintf(stderr, "IP: %s, PORT: %d", ip, PORT);
+        perror("Socket is bad");
         return -1;
     }
-    //Remove end newline
-    message[0] = 'C';
-    message[1] = '\0';
-    message[2] = '\0';
-    message[3] = '\0';
-    message[4] = '\0';
-    message[5] = '\0';
-    message[6] = '\0';
-    message[7] = '\0';
-    message[8] = '\0';
-    
-    send(sock , message , 9, 0); 
-    while(1){
-        valread = read( sock , buffer, 1048576); 
-        if( valread == 0)
-            break;
-        if(valread == -1)
-            continue;
-
-        buffer[valread] = '\0';
-
-
-        printf("From server: %d\n", valread);
+    const char download_request = 'D';
+    write(sock , &download_request, 1); 
+    int len = read(sock, buffer, BUFFER_SIZE);
+    if(len <= 0) {
+        perror("ERROR: problem getting download list from server");
     }
+    buffer[len+1] = '\0';
+    fprintf(stderr, "Download list:\n%s", buffer);
+    FileNetwork net = init_file_network(FILE_SIZE, buffer);
+    
+    int number_of_downloads = 0;
+    for(int i=0;i<MAX_DOWNLOADS;i++) {
+        if(net.downloads[i].connection != -1) {
+            number_of_downloads++;
+        }
+    }
+
+    fd_set dnlwd_set;
+    while(number_of_downloads > 0){
+        FD_ZERO(&dnlwd_set);
+
+        for(int i=0;i<MAX_DOWNLOADS;i++) {
+            if(net.downloads[i].connection != -1) {
+                FD_SET(net.downloads[i].connection, &dnlwd_set);
+            }
+        }
+        
+        if(select(FD_SETSIZE, &dnlwd_set, NULL, NULL, NULL) < 0) {
+            perror("Error attempting to download data");
+        }
+
+        //Update downloads with data
+        for(int i=0;i<MAX_DOWNLOADS;i++) {
+            if(net.downloads[i].connection != -1 && FD_ISSET(net.downloads[i].connection, &dnlwd_set)) {
+                printf("Attempting to do a read of some data\n");
+                enum DownloadStatus stat = read_next_packet(&(net.downloads[i])); 
+                switch(stat) {
+                    case DONE:
+                        if(net.next_unused_chunk < net.num_chunks) {
+                            printf("Attempting to establish a new connection");
+                            restart_download(net.downloads + i, net.chunks + net.next_unused_chunk, net.next_unused_chunk);
+                            if(net.downloads[i].connection < 0) {
+                                perror("Re-establishing a connection failed");
+                            }
+                            else {
+                                printf("Now working on chunk %d\n", net.next_unused_chunk);
+                                net.next_unused_chunk++;
+                            }
+                        }
+                        else {
+                            number_of_downloads--;
+                            printf("Dude we're done here!%d\n", number_of_downloads);
+                        }
+                        break;
+                    case ERROR:
+                        fprintf(stderr, "Connection failed to keep being maintained.");
+                        break;
+                    case CONTINUE:
+                        break;
+                }
+
+            }
+        }
+    }
+
+    printf("Download complete! Attempting to save to file\n");
+    
+    int fd = open(FILE_NAME, O_CREAT | O_WRONLY);
+    if(fd < 0) {
+        perror("Failed to make file");
+    }
+
+    for(int i=0;i<net.num_chunks;i++) {
+        ssize_t index = 0;
+        Chunk *chunk = net.chunks + i;
+        while(index < chunk->index) {
+            int len = write(fd, chunk->data + index, chunk->index - index);
+            if(len < 0) {
+                perror("Error writing to file");
+                return -1;
+            }
+            index += len;
+        }
+    }
+    close(fd);
+
+    printf("File save complete! You can find your file at %s\n", FILE_NAME);
+
     return 0; 
-}  
+}
